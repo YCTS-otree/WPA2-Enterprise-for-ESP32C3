@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # AeroNode MicroPython ESP32-C3 lite trim helper
-# Fix v3: when disabling MicroPython _thread, also disable MICROPY_PY_THREAD_GIL.
+# Fix v4: BLE disabled. MicroPython _thread and GIL are disabled together.
 #
 # Usage in workflow, after cloning/patching MicroPython and before build:
 #   python3 scripts/aeronode_trim.py work/micropython
@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 def replace_define(text: str, name: str, value: str) -> str:
+    """Replace a C #define. If it does not exist, append it."""
     pattern = re.compile(rf"^\s*#\s*define\s+{re.escape(name)}\b.*$", re.M)
     line = f"#define {name} {value}"
     if pattern.search(text):
@@ -21,9 +22,19 @@ def replace_define(text: str, name: str, value: str) -> str:
 
 
 def replace_define_if_present(text: str, name: str, value: str) -> str:
+    """Replace a C #define only when it already exists."""
     pattern = re.compile(rf"^\s*#\s*define\s+{re.escape(name)}\b.*$", re.M)
     line = f"#define {name} {value}"
     return pattern.sub(line, text, count=1)
+
+
+def set_sdkconfig_key(text: str, key: str, value: str) -> str:
+    """Set CONFIG_FOO=y/n in sdkconfig-style text, replacing existing lines."""
+    pattern = re.compile(rf"^\s*{re.escape(key)}=.*$", re.M)
+    line = f"{key}={value}"
+    if pattern.search(text):
+        return pattern.sub(line, text, count=1)
+    return text.rstrip() + "\n" + line + "\n"
 
 
 def patch_mpconfigport(mp_root: Path) -> None:
@@ -33,15 +44,18 @@ def patch_mpconfigport(mp_root: Path) -> None:
 
     text = cfg.read_text(encoding="utf-8")
 
-    # Critical fix:
-    # ESP32 port normally defines both MICROPY_PY_THREAD and MICROPY_PY_THREAD_GIL.
-    # If _thread is disabled but GIL stays enabled, mpstate.h still declares
-    # "mp_thread_mutex_t gil_mutex", while mp_thread_mutex_t is not available.
+    # Disable MicroPython thread support.
+    # Important: _thread and GIL must be disabled together.
+    # Otherwise mpstate.h may still declare mp_thread_mutex_t gil_mutex.
     text = replace_define(text, "MICROPY_PY_THREAD", "(0)")
     text = replace_define(text, "MICROPY_PY_THREAD_GIL", "(0)")
 
-    # Keep BLE enabled, as requested.
-    text = replace_define_if_present(text, "MICROPY_PY_BLUETOOTH", "(1)")
+    # Disable BLE/Bluetooth at MicroPython level.
+    # This avoids extmod/modbluetooth.c requiring mp_thread_* helpers.
+    text = replace_define(text, "MICROPY_PY_BLUETOOTH", "(0)")
+    text = replace_define_if_present(text, "MICROPY_BLUETOOTH_NIMBLE", "(0)")
+    text = replace_define_if_present(text, "MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE", "(0)")
+    text = replace_define_if_present(text, "MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS", "(0)")
 
     # Low-risk savings for the weather station.
     # Do not disable MICROPY_PY_SSL here; PEAP/EAP may need IDF TLS pieces.
@@ -52,7 +66,7 @@ def patch_mpconfigport(mp_root: Path) -> None:
 
     cfg.write_text(text, encoding="utf-8")
     print(f"[AeroNode trim] patched {cfg}")
-    print("[AeroNode trim] MICROPY_PY_THREAD=0, MICROPY_PY_THREAD_GIL=0, BLE kept")
+    print("[AeroNode trim] THREAD=0, GIL=0, BLUETOOTH=0")
 
 
 def patch_sdkconfig_defaults(mp_root: Path, board: str = "ESP32_GENERIC_C3") -> None:
@@ -62,26 +76,24 @@ def patch_sdkconfig_defaults(mp_root: Path, board: str = "ESP32_GENERIC_C3") -> 
         return
 
     sdk = board_dir / "sdkconfig.board"
-    existing = sdk.read_text(encoding="utf-8") if sdk.exists() else ""
+    text = sdk.read_text(encoding="utf-8") if sdk.exists() else ""
 
-    block = """
-# ---- AeroNode lite overrides ----
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_BLUEDROID_ENABLED=n
+    # Disable Bluetooth/BLE at ESP-IDF level.
+    text = set_sdkconfig_key(text, "CONFIG_BT_ENABLED", "n")
+    text = set_sdkconfig_key(text, "CONFIG_BT_NIMBLE_ENABLED", "n")
+    text = set_sdkconfig_key(text, "CONFIG_BT_BLUEDROID_ENABLED", "n")
 
-CONFIG_ESP_WIFI_STA_WPA2_ENT=y
-CONFIG_WPA_MBEDTLS_CRYPTO=y
-CONFIG_WPA_MBEDTLS_TLS_CLIENT=y
+    # Keep Enterprise Wi-Fi / PEAP-related pieces.
+    text = set_sdkconfig_key(text, "CONFIG_ESP_WIFI_STA_WPA2_ENT", "y")
+    text = set_sdkconfig_key(text, "CONFIG_WPA_MBEDTLS_CRYPTO", "y")
+    text = set_sdkconfig_key(text, "CONFIG_WPA_MBEDTLS_TLS_CLIENT", "y")
 
-CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
-"""
-    marker = "# ---- AeroNode lite overrides ----"
-    if marker not in existing:
-        sdk.write_text(existing.rstrip() + "\n\n" + block.lstrip(), encoding="utf-8")
-        print(f"[AeroNode trim] appended {sdk}")
-    else:
-        print(f"[AeroNode trim] sdkconfig overrides already present: {sdk}")
+    # Weather station does not need AP mode.
+    text = set_sdkconfig_key(text, "CONFIG_ESP_WIFI_SOFTAP_SUPPORT", "n")
+
+    sdk.write_text(text.rstrip() + "\n", encoding="utf-8")
+    print(f"[AeroNode trim] patched {sdk}")
+    print("[AeroNode trim] ESP-IDF Bluetooth disabled; WPA2-Enterprise kept")
 
 
 def main() -> int:
