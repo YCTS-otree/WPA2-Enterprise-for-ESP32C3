@@ -16,6 +16,19 @@ output/firmware.bin
 flash_firmware.bat COM73
 ```
 
+## v3 修复说明
+
+v2 的 GitHub Actions 在执行 `make submodules` 时没有传入 `BOARD=ESP32_GENERIC_C3`，MicroPython Makefile 会回落到默认 `ESP32_GENERIC`，于是 CMake 去找 `xtensa-esp32-elf-gcc`。但 C3 是 RISC-V，脚本只安装了 `esp32c3` 工具链，所以会报 `xtensa-esp32-elf-gcc is not a full path and was not found in the PATH`。
+
+v3 已修复为：
+
+```bash
+make BOARD=ESP32_GENERIC_C3 submodules
+make BOARD=ESP32_GENERIC_C3 -j2
+```
+
+本地 WSL 脚本也做了同样修复。
+
 ## 默认路线
 
 默认构建 MicroPython PR #17234，因为它比 #17789 更完整，支持 EAP-PWD、PEAP、TTLS，并且 PR 讨论中维护者也建议优先参考 #17234。#17789 可作为备用。
@@ -88,3 +101,16 @@ examples/enterprise_connect_peap.py
 ```
 
 常见学校无证书账号密码 WiFi 大概率是 PEAP + MSCHAPv2。若学校强制 CA 校验，则仍需要上传学校/eduroam CA 证书并传入 `ca_cert`。
+
+
+## v2 修正说明
+
+上一版默认 ESP-IDF 写成了 `v5.4.0`。Espressif 的实际 tag 通常是 `v5.4`、`v5.4.1`、`v5.4.2` 这种形式，`v5.4.0` / `v5.3.0` 会在 `git clone -b` 阶段直接 exit 128。
+
+本版默认改为 `v5.4.2`，并在克隆前用 `git ls-remote --tags` 检查 tag 是否存在。若仍失败，优先尝试：
+
+```bash
+IDF_VERSION=v5.5.2 MPY_PR=17234 bash scripts/build_wsl.sh
+```
+
+GitHub Actions 手动运行时，`idf_version` 填 `v5.4.2` 或 `v5.5.2`，不要填 `v5.4.0` / `v5.3.0`。

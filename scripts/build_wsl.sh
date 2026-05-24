@@ -5,7 +5,7 @@ ROOT="$(pwd)"
 WORK="$ROOT/work"
 OUT="$ROOT/output"
 LOG="$WORK/build.log"
-IDF_VERSION="${IDF_VERSION:-v5.4.0}"
+IDF_VERSION="${IDF_VERSION:-v5.4.2}"
 MPY_PR="${MPY_PR:-17234}"
 BOARD="${BOARD:-ESP32_GENERIC_C3}"
 JOBS="${JOBS:-$(nproc)}"
@@ -26,12 +26,14 @@ sudo apt-get install -y \
 cd "$WORK"
 if [ ! -d esp-idf/.git ]; then
   echo "[INFO] 克隆 ESP-IDF $IDF_VERSION"
-  git clone -b "$IDF_VERSION" --recursive https://github.com/espressif/esp-idf.git esp-idf
+  git ls-remote --exit-code --tags https://github.com/espressif/esp-idf.git "refs/tags/$IDF_VERSION"
+  git clone --branch "$IDF_VERSION" --depth 1 --recursive https://github.com/espressif/esp-idf.git esp-idf
+  git -C esp-idf submodule update --init --recursive --depth 1 --depth 1
 else
   echo "[INFO] 复用已有 ESP-IDF，并切换到 $IDF_VERSION"
   git -C esp-idf fetch --tags
   git -C esp-idf checkout "$IDF_VERSION"
-  git -C esp-idf submodule update --init --recursive
+  git -C esp-idf submodule update --init --recursive --depth 1
 fi
 
 if [ ! -f esp-idf/export.sh ]; then
@@ -70,7 +72,7 @@ make -C mpy-cross -j"$JOBS"
 
 echo "[INFO] 构建 ESP32-C3 固件"
 cd ports/esp32
-make submodules
+make BOARD="$BOARD" submodules
 make BOARD="$BOARD" -j"$JOBS"
 
 FW="build-${BOARD}/firmware.bin"

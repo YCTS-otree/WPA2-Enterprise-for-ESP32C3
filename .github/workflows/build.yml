@@ -10,7 +10,7 @@ on:
       idf_version:
         description: "ESP-IDF version"
         required: true
-        default: "v5.4.0"
+        default: "v5.4.2"
 
 jobs:
   build:
@@ -26,8 +26,11 @@ jobs:
 
       - name: Clone ESP-IDF
         run: |
-          git clone -b "${{ github.event.inputs.idf_version }}" --recursive https://github.com/espressif/esp-idf.git work/esp-idf
+          IDF_VERSION="${{ github.event.inputs.idf_version }}"
+          git ls-remote --exit-code --tags https://github.com/espressif/esp-idf.git "refs/tags/${IDF_VERSION}"
+          git clone --branch "${IDF_VERSION}" --depth 1 --recursive https://github.com/espressif/esp-idf.git work/esp-idf
           cd work/esp-idf
+          git submodule update --init --recursive --depth 1
           ./install.sh esp32c3
 
       - name: Clone MicroPython PR
@@ -47,7 +50,7 @@ jobs:
           source work/esp-idf/export.sh
           make -C work/micropython/mpy-cross -j2
           cd work/micropython/ports/esp32
-          make submodules
+          make BOARD=ESP32_GENERIC_C3 submodules
           make BOARD=ESP32_GENERIC_C3 -j2
           mkdir -p ../../../output
           cp build-ESP32_GENERIC_C3/firmware.bin ../../../output/firmware.bin
