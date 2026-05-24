@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # AeroNode MicroPython ESP32-C3 lite trim helper
-# Fix v4: BLE disabled. MicroPython _thread and GIL are disabled together.
+# Fix v5: BLE disabled, plus ESP-IDF v5.4 EAP-method compatibility shim.
 #
 # Usage in workflow, after cloning/patching MicroPython and before build:
 #   python3 scripts/aeronode_trim.py work/micropython
@@ -96,6 +96,69 @@ def patch_sdkconfig_defaults(mp_root: Path, board: str = "ESP32_GENERIC_C3") -> 
     print("[AeroNode trim] ESP-IDF Bluetooth disabled; WPA2-Enterprise kept")
 
 
+def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
+    """Patch network_wlan.c so PR #17234 builds on ESP-IDF v5.4.x.
+
+    PR #17234 uses esp_eap_client_set_eap_methods() and ESP_EAP_TYPE_*.
+    These are present in newer ESP-IDF, but not in v5.4.x. For v5.4.x we
+    safely turn the optional method filter into a no-op. Espressif documents
+    that when set_eap_methods() is not called, all supported EAP methods are
+    considered, which is exactly what we want for PEAP/MSCHAPv2 school Wi-Fi.
+    """
+    nw = mp_root / "ports" / "esp32" / "network_wlan.c"
+    if not nw.exists():
+        raise FileNotFoundError(f"Cannot find {nw}")
+
+    text = nw.read_text(encoding="utf-8")
+
+    if "AERONODE_IDF54_EAP_METHODS_COMPAT" in text:
+        print(f"[AeroNode trim] EAP-method compat already present in {nw}")
+        return
+
+    # Make sure ESP_IDF_VERSION / ESP_IDF_VERSION_VAL are available.
+    if '#include "esp_idf_version.h"' not in text:
+        text = re.sub(
+            r'(#include\s+"esp_event\.h"\s*\n)',
+            r'\1#include "esp_idf_version.h"\n',
+            text,
+            count=1,
+        )
+        if '#include "esp_idf_version.h"' not in text:
+            text = '#include "esp_idf_version.h"\n' + text
+
+    shim = '''
+
+// AeroNode: ESP-IDF v5.4.x compatibility for MicroPython WPA2-Enterprise PR #17234.
+// esp_eap_client_set_eap_methods() and ESP_EAP_TYPE_* were added after v5.4.x.
+// On v5.4.x, leaving the method filter unset means "try all supported EAP methods".
+#ifndef AERONODE_IDF54_EAP_METHODS_COMPAT
+#define AERONODE_IDF54_EAP_METHODS_COMPAT (1)
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
+#define ESP_EAP_TYPE_ALL  (0)
+#define ESP_EAP_TYPE_PEAP (0)
+#define ESP_EAP_TYPE_TTLS (0)
+#define ESP_EAP_TYPE_TLS  (0)
+#define esp_eap_client_set_eap_methods(methods) (ESP_OK)
+#endif
+#endif
+'''
+
+    # Put the shim right after esp_eap_client.h if present, otherwise after includes.
+    if '#include "esp_eap_client.h"' in text:
+        text = text.replace('#include "esp_eap_client.h"', '#include "esp_eap_client.h"' + shim, 1)
+    else:
+        matches = list(re.finditer(r'^#include\s+[<"].*[>"]\s*$', text, flags=re.M))
+        if matches:
+            pos = matches[-1].end()
+            text = text[:pos] + shim + text[pos:]
+        else:
+            text = shim + text
+
+    nw.write_text(text, encoding="utf-8")
+    print(f"[AeroNode trim] patched {nw}")
+    print("[AeroNode trim] IDF<5.5 EAP-method filter converted to no-op")
+
+
 def main() -> int:
     if len(sys.argv) >= 2:
         mp_root = Path(sys.argv[1]).resolve()
@@ -108,6 +171,7 @@ def main() -> int:
 
     patch_mpconfigport(mp_root)
     patch_sdkconfig_defaults(mp_root)
+    patch_network_wlan_eap_methods_compat(mp_root)
     return 0
 
 
