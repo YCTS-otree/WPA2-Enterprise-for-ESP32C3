@@ -58,5 +58,8 @@ jobs:
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ESP32_GENERIC_C3_AeroNode_Enterprise_Lite
-          path: output/firmware.bin
+          name: firmware-esp32c3-enterprise
+          path: |
+            work/micropython/ports/esp32/build-ESP32_GENERIC_C3/firmware.bin
+            work/micropython/ports/esp32/build-ESP32_GENERIC_C3/bootloader/bootloader.bin
+            work/micropython/ports/esp32/build-ESP32_GENERIC_C3/partition_table/partition-table.bin
