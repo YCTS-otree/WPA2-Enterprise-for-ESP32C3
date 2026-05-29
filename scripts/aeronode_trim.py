@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # AeroNode MicroPython ESP32-C3 lite trim helper
-# Fix v6: BLE disabled, IDF v5.4 EAP shim, and PEAP/TTLS ca_cert optional.
+# Fix v7: compile-safe PEAP/TTLS no-CA support.
 # Usage in workflow, after cloning/patching MicroPython and before build:
 #   python3 scripts/aeronode_trim.py work/micropython
 
@@ -87,6 +87,19 @@ def patch_sdkconfig_defaults(mp_root: Path, board: str = "ESP32_GENERIC_C3") -> 
     print("[AeroNode trim] ESP-IDF Bluetooth disabled; WPA2-Enterprise kept")
 
 
+def ensure_include_and_insert_after(text: str, include_line: str, insert_text: str, marker: str) -> str:
+    """Ensure insert_text exists once, preferably right after include_line."""
+    if marker in text:
+        return text
+    if include_line in text:
+        return text.replace(include_line, include_line + insert_text, 1)
+    matches = list(re.finditer(r'^#include\s+[<"].*[>"]\s*$', text, flags=re.M))
+    if matches:
+        pos = matches[-1].end()
+        return text[:pos] + insert_text + text[pos:]
+    return insert_text + text
+
+
 def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
     """Patch network_wlan.c so PR #17234 builds on ESP-IDF v5.4.x."""
     nw = mp_root / "ports" / "esp32" / "network_wlan.c"
@@ -94,9 +107,6 @@ def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
         raise FileNotFoundError(f"Cannot find {nw}")
 
     text = nw.read_text(encoding="utf-8")
-    if "AERONODE_IDF54_EAP_METHODS_COMPAT" in text:
-        print(f"[AeroNode trim] EAP-method compat already present in {nw}")
-        return
 
     if '#include "esp_idf_version.h"' not in text:
         text = re.sub(r'(#include\s+"esp_event\.h"\s*\n)', r'\1#include "esp_idf_version.h"\n', text, count=1)
@@ -119,16 +129,12 @@ def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
 #endif
 #endif
 '''
-
-    if '#include "esp_eap_client.h"' in text:
-        text = text.replace('#include "esp_eap_client.h"', '#include "esp_eap_client.h"' + shim, 1)
-    else:
-        matches = list(re.finditer(r'^#include\s+[<"].*[>"]\s*$', text, flags=re.M))
-        if matches:
-            pos = matches[-1].end()
-            text = text[:pos] + shim + text[pos:]
-        else:
-            text = shim + text
+    text = ensure_include_and_insert_after(
+        text,
+        '#include "esp_eap_client.h"',
+        shim,
+        'AERONODE_IDF54_EAP_METHODS_COMPAT',
+    )
 
     nw.write_text(text, encoding="utf-8")
     print(f"[AeroNode trim] patched {nw}")
@@ -136,68 +142,62 @@ def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
 
 
 def patch_network_wlan_make_ca_cert_optional(mp_root: Path) -> None:
-    """Make ca_cert optional for PEAP/TTLS in PR #17234.
+    """Make ca_cert optional for PEAP/TTLS in PR #17234, compile-safely.
 
-    Mirrors Android/iOS style "CA certificate: do not validate" by:
-      1. removing ValueError("missing config param ca_cert");
-      2. calling esp_eap_client_set_ca_cert() only when ca_cert is provided.
+    This does NOT restructure the C block around esp_eap_client_set_ca_cert().
+    Instead it does two safer things:
+      1. remove only the ValueError block that rejects ca_cert=None;
+      2. convert mp_obj_str_get_data(None, ...) into an empty cert buffer;
+      3. macro-wrap esp_eap_client_set_ca_cert(cert, len), returning ESP_OK when len==0.
+
+    Result: Python ca_cert=None means Android-style 'CA certificate: do not validate'.
     """
     nw = mp_root / "ports" / "esp32" / "network_wlan.c"
     if not nw.exists():
         raise FileNotFoundError(f"Cannot find {nw}")
 
     text = nw.read_text(encoding="utf-8")
-    original = text
 
-    # Remove the hard requirement: if ca_cert is None -> raise ValueError.
-    text = re.sub(
+    # Add a macro wrapper after esp_eap_client.h. Self-referential function-like
+    # macro is OK in C: during one expansion the macro name in the replacement is
+    # not expanded again, so non-empty certs still call the real IDF function.
+    shim = '''
+
+// AeroNode: allow PEAP/TTLS without CA cert. Empty cert means 'do not validate CA'.
+#ifndef AERONODE_NO_CA_CERT_COMPAT
+#define AERONODE_NO_CA_CERT_COMPAT (1)
+#define esp_eap_client_set_ca_cert(ca_cert, ca_cert_len) (((ca_cert_len) == 0) ? ESP_OK : esp_eap_client_set_ca_cert((ca_cert), (ca_cert_len)))
+#endif
+'''
+    text = ensure_include_and_insert_after(
+        text,
+        '#include "esp_eap_client.h"',
+        shim,
+        'AERONODE_NO_CA_CERT_COMPAT',
+    )
+
+    # Remove the hard requirement block:
+    #   if (args[ARG_ca_cert].u_obj == mp_const_none) {
+    #       mp_raise_ValueError(MP_ERROR_TEXT("missing config param ca_cert"));
+    #   }
+    text, n_raise = re.subn(
         r'\n[ \t]*if\s*\(\s*args\[ARG_ca_cert\]\.u_obj\s*==\s*mp_const_none\s*\)\s*\{\s*\n'
         r'[ \t]*mp_raise_ValueError\(MP_ERROR_TEXT\("missing config param ca_cert"\)\);\s*\n'
-        r'[ \t]*\}\s*\n',
-        '\n        // AeroNode: ca_cert is optional; skipping CA validation if None.\n',
+        r'[ \t]*\}\s*',
+        '\n        // AeroNode: ca_cert=None allowed; no CA validation.\n',
         text,
         flags=re.M,
     )
 
-    # Wrap nearby ca_cert extraction + esp_eap_client_set_ca_cert() call.
-    lines = text.splitlines()
-    out = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if 'esp_eap_client_set_ca_cert' in line and 'AeroNode: ca_cert optional wrapper' not in ''.join(lines[max(0, i-5):i+1]):
-            start = i
-            for j in range(i - 1, max(-1, i - 10), -1):
-                l = lines[j]
-                if 'ARG_ca_cert' in l or 'ca_cert_len' in l or re.search(r'\bca_cert\b\s*=', l):
-                    start = j
-                if j < start and ('if (' in l or 'switch ' in l or re.match(r'\s*case\b', l)):
-                    break
+    # Make ca_cert extraction tolerate None by producing an empty cert and len=0.
+    old = 'mp_obj_str_get_data(args[ARG_ca_cert].u_obj, &ca_cert_len)'
+    new = '((args[ARG_ca_cert].u_obj == mp_const_none) ? (ca_cert_len = 0, "") : mp_obj_str_get_data(args[ARG_ca_cert].u_obj, &ca_cert_len))'
+    n_get = text.count(old)
+    text = text.replace(old, new)
 
-            while len(out) < start:
-                out.append(lines[len(out)])
-
-            indent = re.match(r'^(\s*)', lines[start]).group(1)
-            out.append(indent + '// AeroNode: ca_cert optional wrapper; None means no CA validation.')
-            out.append(indent + 'if (args[ARG_ca_cert].u_obj != mp_const_none) {')
-            for k in range(start, i + 1):
-                out.append(indent + '    ' + lines[k][len(indent):])
-            out.append(indent + '}')
-            i += 1
-            continue
-
-        if len(out) == i:
-            out.append(line)
-        i += 1
-
-    text = '\n'.join(out) + ('\n' if original.endswith('\n') else '')
-
-    if text == original:
-        print(f"[AeroNode trim] PEAP no-CA patch made no changes; check PR code manually: {nw}")
-    else:
-        nw.write_text(text, encoding="utf-8")
-        print(f"[AeroNode trim] patched {nw}")
-        print("[AeroNode trim] PEAP/TTLS ca_cert is now optional; None = do not validate CA")
+    nw.write_text(text, encoding="utf-8")
+    print(f"[AeroNode trim] patched {nw}")
+    print(f"[AeroNode trim] PEAP/TTLS ca_cert optional: removed_checks={n_raise}, patched_get_data={n_get}")
 
 
 def main() -> int:
