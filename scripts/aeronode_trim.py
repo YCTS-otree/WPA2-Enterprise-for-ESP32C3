@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # AeroNode MicroPython ESP32-C3 lite trim helper
-# Fix v5: BLE disabled, plus ESP-IDF v5.4 EAP-method compatibility shim.
-#
+# Fix v6: BLE disabled, IDF v5.4 EAP shim, and PEAP/TTLS ca_cert optional.
 # Usage in workflow, after cloning/patching MicroPython and before build:
 #   python3 scripts/aeronode_trim.py work/micropython
 
@@ -13,7 +12,6 @@ from pathlib import Path
 
 
 def replace_define(text: str, name: str, value: str) -> str:
-    """Replace a C #define. If it does not exist, append it."""
     pattern = re.compile(rf"^\s*#\s*define\s+{re.escape(name)}\b.*$", re.M)
     line = f"#define {name} {value}"
     if pattern.search(text):
@@ -22,14 +20,11 @@ def replace_define(text: str, name: str, value: str) -> str:
 
 
 def replace_define_if_present(text: str, name: str, value: str) -> str:
-    """Replace a C #define only when it already exists."""
     pattern = re.compile(rf"^\s*#\s*define\s+{re.escape(name)}\b.*$", re.M)
-    line = f"#define {name} {value}"
-    return pattern.sub(line, text, count=1)
+    return pattern.sub(f"#define {name} {value}", text, count=1)
 
 
 def set_sdkconfig_key(text: str, key: str, value: str) -> str:
-    """Set CONFIG_FOO=y/n in sdkconfig-style text, replacing existing lines."""
     pattern = re.compile(rf"^\s*{re.escape(key)}=.*$", re.M)
     line = f"{key}={value}"
     if pattern.search(text):
@@ -44,21 +39,17 @@ def patch_mpconfigport(mp_root: Path) -> None:
 
     text = cfg.read_text(encoding="utf-8")
 
-    # Disable MicroPython thread support.
-    # Important: _thread and GIL must be disabled together.
-    # Otherwise mpstate.h may still declare mp_thread_mutex_t gil_mutex.
+    # Disable MicroPython thread support; _thread and GIL must be disabled together.
     text = replace_define(text, "MICROPY_PY_THREAD", "(0)")
     text = replace_define(text, "MICROPY_PY_THREAD_GIL", "(0)")
 
     # Disable BLE/Bluetooth at MicroPython level.
-    # This avoids extmod/modbluetooth.c requiring mp_thread_* helpers.
     text = replace_define(text, "MICROPY_PY_BLUETOOTH", "(0)")
     text = replace_define_if_present(text, "MICROPY_BLUETOOTH_NIMBLE", "(0)")
     text = replace_define_if_present(text, "MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE", "(0)")
     text = replace_define_if_present(text, "MICROPY_PY_BLUETOOTH_ENABLE_L2CAP_CHANNELS", "(0)")
 
-    # Low-risk savings for the weather station.
-    # Do not disable MICROPY_PY_SSL here; PEAP/EAP may need IDF TLS pieces.
+    # Low-risk savings for the weather station. Do not disable SSL/TLS.
     text = replace_define_if_present(text, "MICROPY_PY_WEBREPL", "(0)")
     text = replace_define_if_present(text, "MICROPY_PY_WEBSOCKET", "(0)")
     text = replace_define_if_present(text, "MICROPY_PY_SOCKET_EVENTS", "(0)")
@@ -97,32 +88,18 @@ def patch_sdkconfig_defaults(mp_root: Path, board: str = "ESP32_GENERIC_C3") -> 
 
 
 def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
-    """Patch network_wlan.c so PR #17234 builds on ESP-IDF v5.4.x.
-
-    PR #17234 uses esp_eap_client_set_eap_methods() and ESP_EAP_TYPE_*.
-    These are present in newer ESP-IDF, but not in v5.4.x. For v5.4.x we
-    safely turn the optional method filter into a no-op. Espressif documents
-    that when set_eap_methods() is not called, all supported EAP methods are
-    considered, which is exactly what we want for PEAP/MSCHAPv2 school Wi-Fi.
-    """
+    """Patch network_wlan.c so PR #17234 builds on ESP-IDF v5.4.x."""
     nw = mp_root / "ports" / "esp32" / "network_wlan.c"
     if not nw.exists():
         raise FileNotFoundError(f"Cannot find {nw}")
 
     text = nw.read_text(encoding="utf-8")
-
     if "AERONODE_IDF54_EAP_METHODS_COMPAT" in text:
         print(f"[AeroNode trim] EAP-method compat already present in {nw}")
         return
 
-    # Make sure ESP_IDF_VERSION / ESP_IDF_VERSION_VAL are available.
     if '#include "esp_idf_version.h"' not in text:
-        text = re.sub(
-            r'(#include\s+"esp_event\.h"\s*\n)',
-            r'\1#include "esp_idf_version.h"\n',
-            text,
-            count=1,
-        )
+        text = re.sub(r'(#include\s+"esp_event\.h"\s*\n)', r'\1#include "esp_idf_version.h"\n', text, count=1)
         if '#include "esp_idf_version.h"' not in text:
             text = '#include "esp_idf_version.h"\n' + text
 
@@ -143,7 +120,6 @@ def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
 #endif
 '''
 
-    # Put the shim right after esp_eap_client.h if present, otherwise after includes.
     if '#include "esp_eap_client.h"' in text:
         text = text.replace('#include "esp_eap_client.h"', '#include "esp_eap_client.h"' + shim, 1)
     else:
@@ -159,6 +135,71 @@ def patch_network_wlan_eap_methods_compat(mp_root: Path) -> None:
     print("[AeroNode trim] IDF<5.5 EAP-method filter converted to no-op")
 
 
+def patch_network_wlan_make_ca_cert_optional(mp_root: Path) -> None:
+    """Make ca_cert optional for PEAP/TTLS in PR #17234.
+
+    Mirrors Android/iOS style "CA certificate: do not validate" by:
+      1. removing ValueError("missing config param ca_cert");
+      2. calling esp_eap_client_set_ca_cert() only when ca_cert is provided.
+    """
+    nw = mp_root / "ports" / "esp32" / "network_wlan.c"
+    if not nw.exists():
+        raise FileNotFoundError(f"Cannot find {nw}")
+
+    text = nw.read_text(encoding="utf-8")
+    original = text
+
+    # Remove the hard requirement: if ca_cert is None -> raise ValueError.
+    text = re.sub(
+        r'\n[ \t]*if\s*\(\s*args\[ARG_ca_cert\]\.u_obj\s*==\s*mp_const_none\s*\)\s*\{\s*\n'
+        r'[ \t]*mp_raise_ValueError\(MP_ERROR_TEXT\("missing config param ca_cert"\)\);\s*\n'
+        r'[ \t]*\}\s*\n',
+        '\n        // AeroNode: ca_cert is optional; skipping CA validation if None.\n',
+        text,
+        flags=re.M,
+    )
+
+    # Wrap nearby ca_cert extraction + esp_eap_client_set_ca_cert() call.
+    lines = text.splitlines()
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if 'esp_eap_client_set_ca_cert' in line and 'AeroNode: ca_cert optional wrapper' not in ''.join(lines[max(0, i-5):i+1]):
+            start = i
+            for j in range(i - 1, max(-1, i - 10), -1):
+                l = lines[j]
+                if 'ARG_ca_cert' in l or 'ca_cert_len' in l or re.search(r'\bca_cert\b\s*=', l):
+                    start = j
+                if j < start and ('if (' in l or 'switch ' in l or re.match(r'\s*case\b', l)):
+                    break
+
+            while len(out) < start:
+                out.append(lines[len(out)])
+
+            indent = re.match(r'^(\s*)', lines[start]).group(1)
+            out.append(indent + '// AeroNode: ca_cert optional wrapper; None means no CA validation.')
+            out.append(indent + 'if (args[ARG_ca_cert].u_obj != mp_const_none) {')
+            for k in range(start, i + 1):
+                out.append(indent + '    ' + lines[k][len(indent):])
+            out.append(indent + '}')
+            i += 1
+            continue
+
+        if len(out) == i:
+            out.append(line)
+        i += 1
+
+    text = '\n'.join(out) + ('\n' if original.endswith('\n') else '')
+
+    if text == original:
+        print(f"[AeroNode trim] PEAP no-CA patch made no changes; check PR code manually: {nw}")
+    else:
+        nw.write_text(text, encoding="utf-8")
+        print(f"[AeroNode trim] patched {nw}")
+        print("[AeroNode trim] PEAP/TTLS ca_cert is now optional; None = do not validate CA")
+
+
 def main() -> int:
     if len(sys.argv) >= 2:
         mp_root = Path(sys.argv[1]).resolve()
@@ -172,6 +213,7 @@ def main() -> int:
     patch_mpconfigport(mp_root)
     patch_sdkconfig_defaults(mp_root)
     patch_network_wlan_eap_methods_compat(mp_root)
+    patch_network_wlan_make_ca_cert_optional(mp_root)
     return 0
 
 
