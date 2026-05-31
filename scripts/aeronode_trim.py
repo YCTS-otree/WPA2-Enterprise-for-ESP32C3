@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # AeroNode MicroPython ESP32-C3 trim helper
-# Fix v8: strict PEAP no-CA patch, IDF 5.4 EAP shim, EAP min_sec fix.
+# Fix v9:
+#   - disable thread/GIL/BLE
+#   - ESP-IDF 5.4 EAP-method compatibility
+#   - PEAP/TTLS allow ca_cert=None / ca_cert="" without hard error
+#   - EAP implies WPA2-Enterprise min_sec by default
 
 from __future__ import annotations
+
 import re
 import sys
 from pathlib import Path
@@ -109,6 +114,8 @@ def patch_network_wlan(mp_root: Path) -> None:
         "AERONODE_IDF54_EAP_METHODS_COMPAT",
     )
 
+    # This macro is intentionally conservative:
+    # non-empty CA data goes to the real IDF function, empty CA data becomes no-op.
     no_ca_shim = '''
 // AeroNode: empty CA cert means no CA validation.
 #ifndef AERONODE_NO_CA_CERT_COMPAT
@@ -123,27 +130,41 @@ def patch_network_wlan(mp_root: Path) -> None:
         "AERONODE_NO_CA_CERT_COMPAT",
     )
 
-    before_hard_error_count = text.count("missing config param ca_cert")
+    old_ca_errors = text.count("missing config param ca_cert")
 
-    # PR #17234 uses "missing config param ca_cert." with a period on some versions.
-    text, removed_checks = re.subn(
-        r'\n[ \t]*if\s*\(\s*args\[ARG_ca_cert\]\.u_obj\s*==\s*mp_const_none\s*\)\s*\{\s*\n'
-        r'[ \t]*mp_raise_ValueError\(MP_ERROR_TEXT\("missing config param ca_cert\.?"\)\);\s*\n'
-        r'[ \t]*\}\s*',
-        '\n        // AeroNode: ca_cert=None allowed; no CA validation.\n',
+    # Remove the actual raise statement only.
+    # This avoids depending on the exact if-block formatting in PR #17234.
+    text, removed_raises = re.subn(
+        r'mp_raise_ValueError\s*\(\s*MP_ERROR_TEXT\s*\(\s*"missing config param ca_cert\.?"\s*\)\s*\)\s*;',
+        '/* AeroNode: ca_cert is optional; no CA validation when empty. */;',
         text,
         flags=re.M,
     )
 
-    old_get = 'mp_obj_str_get_data(args[ARG_ca_cert].u_obj, &ca_cert_len)'
-    new_get = '((args[ARG_ca_cert].u_obj == mp_const_none) ? (ca_cert_len = 0, "") : mp_obj_str_get_data(args[ARG_ca_cert].u_obj, &ca_cert_len))'
-    patched_get_data = text.count(old_get)
-    text = text.replace(old_get, new_get)
-
+    # After MicroPython parses args, convert ca_cert=None into the empty string.
+    # That keeps the original PR code shape intact while preventing later str conversion
+    # from seeing mp_const_none.
     parse_line = "mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);"
-    if "AeroNode: EAP implies WPA2 Enterprise" not in text:
-        if parse_line not in text:
-            raise RuntimeError("Cannot find mp_arg_parse_all line; PR code shape changed")
+    if parse_line not in text:
+        raise RuntimeError("Cannot find mp_arg_parse_all line; PR code shape changed")
+
+    if "AeroNode: normalize ca_cert None to empty string" not in text:
+        text = text.replace(
+            parse_line,
+            parse_line + '''
+    // AeroNode: normalize ca_cert None to empty string.
+    if (args[ARG_ca_cert].u_obj == mp_const_none) {
+        args[ARG_ca_cert].u_obj = MP_OBJ_NEW_QSTR(MP_QSTR_);
+    }
+
+    // AeroNode: EAP implies WPA2 Enterprise.
+    if (args[ARG_eap_method].u_int != WIFI_AUTH_EAP_NONE
+        && args[ARG_min_sec].u_int == WIFI_AUTH_WPA2_PSK) {
+        args[ARG_min_sec].u_int = WIFI_AUTH_WPA2_ENTERPRISE;
+    }''',
+            1,
+        )
+    elif "AeroNode: EAP implies WPA2 Enterprise" not in text:
         text = text.replace(
             parse_line,
             parse_line + '''
@@ -156,17 +177,19 @@ def patch_network_wlan(mp_root: Path) -> None:
         )
 
     nw.write_text(text, encoding="utf-8")
+
+    remaining = text.count("missing config param ca_cert")
     print(
         "[AeroNode trim] network_wlan patched: "
-        f"old_ca_errors={before_hard_error_count}, "
-        f"removed_checks={removed_checks}, "
-        f"patched_get_data={patched_get_data}"
+        f"old_ca_errors={old_ca_errors}, "
+        f"removed_raises={removed_raises}, "
+        f"remaining_ca_errors={remaining}"
     )
 
-    if "missing config param ca_cert" in text:
-        raise RuntimeError("no-CA patch failed: ca_cert hard error is still present")
-    if removed_checks < 1:
-        raise RuntimeError("no-CA patch failed: removed_checks=0")
+    if removed_raises < 1:
+        raise RuntimeError("no-CA patch failed: removed_raises=0")
+    if remaining:
+        raise RuntimeError("no-CA patch failed: ca_cert hard error text still present")
 
 
 def main() -> int:
